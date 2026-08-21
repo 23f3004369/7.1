@@ -130,9 +130,6 @@ def release_gate():
 # QUESTION 2 - LLM ACTION FIREWALL
 # ============================================================
 
-# ============================================================
-# QUESTION 2 - LLM ACTION FIREWALL
-# ============================================================
 
 ASSIGNED_TENANT = "tenant-lo8qnjv"
 ALLOWED_EMAIL_DOMAIN = "notify-gazt8nx.example"
@@ -392,274 +389,86 @@ def health():
 # QUESTION 3 - TERRAFORM PLAN POLICY GATE
 # ============================================================
 
-TERRAFORM_ENVIRONMENT = "prod-g24y5b"
-
+# Configuration
+REQUIRED_ENVIRONMENT = "prod-g24y5b"
 REQUIRED_LABELS = {
-    "owner": "student-eh0vk",
+    "owner": "student-0h0vk",
     "environment": "production",
-    "cost_center": "cc-pcwi",
+    "cost_center": "cc-pcwi"
 }
+ALLOWED_BACKENDS = {"gcs", "s3", "azurerm", "remote"}
+STATEFUL_RESOURCES = {"storage_bucket", "sql_database", "persistent_disk"}
+# Valid provider versions: exact match (6.2.1), equals ( = 6.2.1), or ~>6.0
+VALID_PROVIDER_PATTERN = re.compile(r'^(6\.2\.1|= ?6\.2\.1|~> ?6\.0)$')
 
-ALLOWED_STATE_BACKENDS = {
-    "gcs",
-    "s3",
-    "azurerm",
-    "remote",
-}
-
-PROTECTED_DELETE_TYPES = {
-    "storage_bucket",
-    "sql_database",
-    "persistent_disk",
-}
-
-
-def terraform_response(decision, reason):
-    return jsonify({
-        "decision": decision,
-        "reason": reason
-    })
-
-
-def valid_terraform_plan(data):
-    """
-    Validate the request and the required nested value types.
-    """
-
-    if not isinstance(data, dict):
-        return False
-
-    # Required top-level fields
-    required_top = {
-        "environment",
-        "state",
-        "providerVersion",
-        "destroyApproved",
-        "resource"
-    }
-
-    if not required_top.issubset(data):
-        return False
-
-    # Top-level types
-    if not isinstance(data["environment"], str):
-        return False
-
-    if not isinstance(data["providerVersion"], str):
-        return False
-
-    if not isinstance(data["destroyApproved"], bool):
-        return False
-
-    # --------------------------------------------------------
-    # STATE
-    # --------------------------------------------------------
-
-    state = data["state"]
-
-    if not isinstance(state, dict):
-        return False
-
-    if "backend" not in state or "locked" not in state:
-        return False
-
-    if not isinstance(state["backend"], str):
-        return False
-
-    if not isinstance(state["locked"], bool):
-        return False
-
-    # --------------------------------------------------------
-    # RESOURCE
-    # --------------------------------------------------------
-
-    resource = data["resource"]
-
-    if not isinstance(resource, dict):
-        return False
-
-    required_resource = {
-        "address",
-        "type",
-        "action",
-        "labels",
-        "secret",
-        "forceDestroy"
-    }
-
-    if not required_resource.issubset(resource):
-        return False
-
-    if not isinstance(resource["address"], str):
-        return False
-
-    if not isinstance(resource["type"], str):
-        return False
-
-    if not isinstance(resource["action"], str):
-        return False
-
-    if resource["action"] not in {
-        "create",
-        "update",
-        "delete"
-    }:
-        return False
-
-    if not isinstance(resource["labels"], dict):
-        return False
-
-    if not isinstance(resource["forceDestroy"], bool):
-        return False
-
-    # Every label key/value must be a string
-    for key, value in resource["labels"].items():
-        if not isinstance(key, str):
-            return False
-        if not isinstance(value, str):
-            return False
-
-    # secret is allowed to be null or string
-    if resource["secret"] is not None:
-        if not isinstance(resource["secret"], str):
-            return False
-
-    return True
-
-
-def valid_provider_version(version):
-    return version in {
-        "6.2.1",
-        "= 6.2.1",
-        "~> 6.0"
-    }
-
-
-def valid_secret(secret):
-    if secret is None:
-        return True
-
-    if not isinstance(secret, str):
-        return False
-
-    return secret.startswith("secret://") and len(secret) > len("secret://")
-
-
-@app.route("/terraform/plan", methods=["POST"])
+@app.route('/terraform/plan', methods=['POST'])
 def terraform_plan():
+    try:
+        payload = request.get_json(force=True, silent=False)
+    except Exception as e:
+        return jsonify({"decision": "reject", "reason": "INVALID_PLAN"}), 400
 
-    data = request.get_json(silent=True)
+    # Rule 1: Validate request structure
+    try:
+        # Environment check
+        if not isinstance(payload, dict) or not isinstance(payload.get("environment"), str):
+            raise ValueError("Invalid payload structure")
+        
+        # State validation
+        state = payload.get("state")
+        if not isinstance(state, dict) or state.get("locked") is not True:
+            raise ValueError("Invalid state format")
+        
+        # Provider version
+        provider_ver = payload.get("providerVersion", "").strip()
+        if not VALID_PROVIDER_PATTERN.match(provider_ver):
+            raise ValueError("Unpinned provider version")
+        
+        # Labels
+        labels = payload.get("resource", {}).get("labels", {})
+        for key, value in REQUIRED_LABELS.items():
+            if labels.get(key) != value:
+                raise ValueError(f"Missing label: {key}")
+        
+        # Secret validation
+        secret = payload.get("resource", {}).get("secret")
+        if secret is not None:
+            if not (secret.startswith("secret://") and len(secret) > 9):
+                raise ValueError("Invalid secret reference")
+        
+        # Stateful delete approval
+        resource = payload.get("resource", {})
+        if (resource.get("action") == "delete" and 
+            resource.get("type") in STATEFUL_RESOURCES):
+            if not payload.get("destroyApproved"):
+                raise ValueError("Missing destroy approval")
+        
+        # ForceDestroy protection
+        if (resource.get("type") == "storage_bucket" and 
+            resource.get("forceDestroy")):
+            raise ValueError("Forbidden destroy mode")
+            
+    except Exception as e:
+        # Return specific violation codes
+        if "Missing label" in str(e):
+            return jsonify({"decision": "reject", "reason": "MISSING_LABELS"}), 400
+        elif "Invalid secret reference" in str(e):
+            return jsonify({"decision": "reject", "reason": "PLAINTEXT_SECRET"}), 400
+        elif "Forbidden destroy mode" in str(e):
+            return jsonify({"decision": "reject", "reason": "FORCE_DESTROY"}), 400
+        else:
+            return jsonify({"decision": "reject", "reason": "INVALID_PLAN"}), 400
 
-    # --------------------------------------------------------
-    # 1. SCHEMA
-    # --------------------------------------------------------
+    # All rules passed
+    return jsonify({
+        "decision": "approve",
+        "reason": "APPROVE"
+    }), 200
 
-    if not valid_terraform_plan(data):
-        return terraform_response(
-            "reject",
-            "INVALID_PLAN"
-        )
+if __name__ == '__main__':
+    # Run in production mode (Render will set port via environment variable)
+    import sys
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+    app.run(host='0.0.0.0', port=port)
 
-    state = data["state"]
-    resource = data["resource"]
-    labels = resource["labels"]
 
-    # --------------------------------------------------------
-    # 2. ENVIRONMENT
-    # --------------------------------------------------------
-
-    if data["environment"] != TERRAFORM_ENVIRONMENT:
-        return terraform_response(
-            "reject",
-            "ENVIRONMENT_MISMATCH"
-        )
-
-    # --------------------------------------------------------
-    # 3. STATE
-    # --------------------------------------------------------
-
-    if (
-        state["backend"] not in ALLOWED_STATE_BACKENDS
-        or state["locked"] is not True
-    ):
-        return terraform_response(
-            "reject",
-            "STATE_UNSAFE"
-        )
-
-    # --------------------------------------------------------
-    # 4. PROVIDER
-    # --------------------------------------------------------
-
-    if not valid_provider_version(
-        data["providerVersion"]
-    ):
-        return terraform_response(
-            "reject",
-            "UNPINNED_PROVIDER"
-        )
-
-    # --------------------------------------------------------
-    # 5. LABELS
-    # --------------------------------------------------------
-
-    for key, expected in REQUIRED_LABELS.items():
-        if labels.get(key) != expected:
-            return terraform_response(
-                "reject",
-                "MISSING_LABELS"
-            )
-
-    # --------------------------------------------------------
-    # 6. SECRET
-    # --------------------------------------------------------
-
-    if not valid_secret(resource["secret"]):
-        return terraform_response(
-            "reject",
-            "PLAINTEXT_SECRET"
-        )
-
-    # --------------------------------------------------------
-    # 7. STATEFUL DELETE
-    # --------------------------------------------------------
-
-    if (
-        resource["action"] == "delete"
-        and resource["type"] in PROTECTED_DELETE_TYPES
-        and data["destroyApproved"] is not True
-    ):
-        return terraform_response(
-            "reject",
-            "DELETE_NOT_APPROVED"
-        )
-
-    # --------------------------------------------------------
-    # 8. PRODUCTION FORCE DESTROY
-    # --------------------------------------------------------
-
-    if (
-        resource["type"] == "storage_bucket"
-        and labels.get("environment") == "production"
-        and resource["forceDestroy"] is True
-    ):
-        return terraform_response(
-            "reject",
-            "FORCE_DESTROY"
-        )
-
-    # --------------------------------------------------------
-    # ALL RULES PASSED
-    # --------------------------------------------------------
-
-    return terraform_response(
-        "approve",
-        "APPROVE"
-    )
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
