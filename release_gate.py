@@ -495,6 +495,12 @@ def valid_terraform_plan(data):
     if not isinstance(resource["labels"], dict):
         return False
 
+    if not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in resource["labels"].items()
+    ):
+        return False
+
     if not isinstance(resource["forceDestroy"], bool):
         return False
 
@@ -627,7 +633,11 @@ def terraform_plan():
 
     if (
         resource["action"] == "delete"
-        and resource["type"] in DELETE_REQUIRES_APPROVAL
+        and resource["type"] in {
+            "storage_bucket",
+            "sql_database",
+            "persistent_disk",
+        }
         and data["destroyApproved"] is not True
     ):
         return terraform_response(
@@ -640,9 +650,9 @@ def terraform_plan():
     # --------------------------------------------------------
 
     if (
-        data["environment"] == TERRAFORM_ENVIRONMENT
-        and resource["type"] == "storage_bucket"
+        resource["type"] == "storage_bucket"
         and resource["forceDestroy"] is True
+        and labels.get("environment") == "production"
     ):
         return terraform_response(
             "reject",
