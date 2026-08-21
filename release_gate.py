@@ -130,10 +130,25 @@ def release_gate():
 # QUESTION 2 - LLM ACTION FIREWALL
 # ============================================================
 
+# ============================================================
+# QUESTION 2 - LLM ACTION FIREWALL
+# ============================================================
+
+ASSIGNED_TENANT = "tenant-lo8qnjv"
+ALLOWED_EMAIL_DOMAIN = "notify-gazt8nx.example"
+
+ALLOWED_TOOLS = {
+    "search",
+    "lookup_record",
+    "send_email",
+    "render_html",
+}
+
+
 def firewall_response(decision, reason):
     return jsonify({
         "decision": decision,
-        "reason": reason
+        "reason": reason,
     })
 
 
@@ -141,23 +156,25 @@ def valid_top_level(data):
     if not isinstance(data, dict):
         return False
 
-    required_keys = {
+    # These are the required top-level fields.
+    required = {
         "provenance",
         "humanApproved",
-        "untrustedContent",
-        "action"
+        "action",
     }
 
-    if set(data.keys()) != required_keys:
+    if not required.issubset(data.keys()):
         return False
+
+    # untrustedContent is optional.
+    if "untrustedContent" in data:
+        if not isinstance(data["untrustedContent"], str):
+            return False
 
     if data["provenance"] not in {"trusted", "untrusted"}:
         return False
 
     if not isinstance(data["humanApproved"], bool):
-        return False
-
-    if not isinstance(data["untrustedContent"], str):
         return False
 
     action = data["action"]
@@ -178,9 +195,6 @@ def valid_top_level(data):
 
 
 def validate_tool_args(tool, args):
-
-    if not isinstance(args, dict):
-        return False
 
     if tool == "search":
         return (
@@ -216,47 +230,48 @@ def validate_tool_args(tool, args):
     return False
 
 
-def email_domain_allowed(address):
+def valid_email_domain(address):
+    if not isinstance(address, str):
+        return False
 
-    if "@" not in address:
+    # Exactly one @.
+    if address.count("@") != 1:
         return False
 
     local, domain = address.rsplit("@", 1)
 
-    if not local or not domain:
+    if not local:
         return False
 
+    # Exact domain match.
     return domain == ALLOWED_EMAIL_DOMAIN
 
 
 def unsafe_html(html):
+    """
+    Deterministic HTML safety check.
 
-    if re.search(
-        r"<\s*script\b",
-        html,
-        re.IGNORECASE
-    ):
+    Reject:
+    - script tags
+    - iframe tags
+    - inline event handlers
+    - javascript: URLs
+    """
+
+    if re.search(r"<\s*script\b", html, re.IGNORECASE):
         return True
 
-    if re.search(
-        r"<\s*iframe\b",
-        html,
-        re.IGNORECASE
-    ):
+    if re.search(r"<\s*/\s*script\s*>", html, re.IGNORECASE):
         return True
 
-    if re.search(
-        r"\bon[a-zA-Z]+\s*=",
-        html,
-        re.IGNORECASE
-    ):
+    if re.search(r"<\s*iframe\b", html, re.IGNORECASE):
         return True
 
-    if re.search(
-        r"javascript\s*:",
-        html,
-        re.IGNORECASE
-    ):
+    # onclick=, onload=, onerror=, onmouseover=, etc.
+    if re.search(r"\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=", html, re.IGNORECASE):
+        return True
+
+    if re.search(r"javascript\s*:", html, re.IGNORECASE):
         return True
 
     return False
@@ -265,7 +280,10 @@ def unsafe_html(html):
 @app.route("/action-firewall", methods=["POST"])
 def action_firewall():
 
-    # 1. Top-level schema
+    # --------------------------------------------------------
+    # 1. TOP-LEVEL SCHEMA
+    # --------------------------------------------------------
+
     try:
         data = request.get_json()
     except Exception:
@@ -284,51 +302,77 @@ def action_firewall():
     tool = action["tool"]
     args = action["args"]
 
-    # 2. Tool allowlist
+    # --------------------------------------------------------
+    # 2. TOOL ALLOWLIST
+    # --------------------------------------------------------
+
     if tool not in ALLOWED_TOOLS:
         return firewall_response(
             "block",
             "TOOL_NOT_ALLOWED"
         )
 
-    # 3. Tool argument schema
+    # --------------------------------------------------------
+    # 3. SELECTED TOOL ARGUMENT SCHEMA
+    # --------------------------------------------------------
+
     if not validate_tool_args(tool, args):
         return firewall_response(
             "block",
             "INVALID_SCHEMA"
         )
 
-    # 4. Tenant scope
+    # --------------------------------------------------------
+    # 4. TENANT SCOPE
+    # --------------------------------------------------------
+
     if tool == "lookup_record":
+
         if args["tenantId"] != ASSIGNED_TENANT:
             return firewall_response(
                 "block",
                 "TENANT_SCOPE"
             )
 
-    # 5. Exact email domain
+    # --------------------------------------------------------
+    # 5. EMAIL EGRESS
+    # --------------------------------------------------------
+
     if tool == "send_email":
-        if not email_domain_allowed(args["to"]):
+
+        if not valid_email_domain(args["to"]):
             return firewall_response(
                 "block",
                 "EGRESS_DENIED"
             )
 
-    # 6. Human approval
+    # --------------------------------------------------------
+    # 6. HUMAN APPROVAL
+    # --------------------------------------------------------
+
     if tool == "send_email":
+
         if data["humanApproved"] is not True:
             return firewall_response(
                 "block",
                 "APPROVAL_REQUIRED"
             )
 
-    # 7. HTML safety
+    # --------------------------------------------------------
+    # 7. SAFE HTML OUTPUT
+    # --------------------------------------------------------
+
     if tool == "render_html":
+
         if unsafe_html(args["html"]):
             return firewall_response(
                 "block",
                 "UNSAFE_OUTPUT"
             )
+
+    # --------------------------------------------------------
+    # EVERYTHING PASSED
+    # --------------------------------------------------------
 
     return firewall_response(
         "allow",
