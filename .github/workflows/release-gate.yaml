@@ -1,4 +1,5 @@
 name: TDS GA7 Release Gate
+
 on:
   push:
     branches: [main]
@@ -6,27 +7,70 @@ on:
 jobs:
   test-release-gate:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: TDS identity: 23f3004369@ds.study.iitm.ac.in
-        run: echo "TDS identity: 23f3004369@ds.study.iitm.ac.in"  
+      - name: "TDS identity: 23f3004369@ds.study.iitm.ac.in"
+        run: echo "TDS identity: 23f3004369@ds.study.iitm.ac.in"
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: "3.9"
 
       - name: Install dependencies
         run: pip install flask
 
       - name: Start Release Gate
-        run: python release_gate.py &
+        run: |
+          python release_gate.py &
+          sleep 3
 
       - name: Test Release Gate with valid payload
         run: |
-          curl -s -X POST http://localhost:8080/release-gate \
+          response=$(curl -s -X POST http://localhost:8080/release-gate \
             -H "Content-Type: application/json" \
-            -d '{"target":"production","event":"push","ref":"refs/heads/main","workflow":{"permissions":{"contents":"read","packages":"write","id-token":"none"},"testsPassed":true,"matrixComplete":true,"failFast":false,"actions":[{"owner":"actions","name":"checkout","ref":"v4"}]},"image":{"multiStage":true,"runsAsRoot":false,"secretMode":"none","criticalVulnerabilities":0,"digestPinned":true}}' \
-            |  jq .decision
+            -d '{
+              "target": "production",
+              "event": "push",
+              "ref": "refs/heads/main",
+              "workflow": {
+                "trigger": "push",
+                "permissions": {
+                  "contents": "read",
+                  "packages": "write",
+                  "id-token": "none"
+                },
+                "testsPassed": true,
+                "matrixComplete": true,
+                "failFast": true,
+                "environmentApproval": true
+              },
+              "actions": [
+                {
+                  "owner": "actions",
+                  "name": "checkout",
+                  "ref": "v4"
+                }
+              ],
+              "image": {
+                "multistage": true,
+                "runsAsRoot": false,
+                "secretMode": "none",
+                "criticalVulnerabilities": 0,
+                "digestPinned": true
+              }
+            }')
+
+          echo "$response"
+
+          decision=$(echo "$response" | jq -r '.decision')
+
+          if [ "$decision" != "promote" ]; then
+            echo "Release gate test failed"
+            exit 1
+          fi
+
+          echo "Release gate test passed"
