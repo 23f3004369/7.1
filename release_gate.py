@@ -392,7 +392,7 @@ def health():
 TERRAFORM_ENVIRONMENT = "prod-g24y5b"
 
 REQUIRED_LABELS = {
-    "owner": "student-eh0vk",
+    "owner": "student-0h0vk",
     "environment": "production",
     "cost_center": "cc-pcwi",
 }
