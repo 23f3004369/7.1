@@ -388,6 +388,288 @@ def action_firewall():
 def health():
     return jsonify({"status": "ok"})
 
+# ============================================================
+# QUESTION 3 - TERRAFORM PLAN POLICY GATE
+# ============================================================
+
+TERRAFORM_ENVIRONMENT = "prod-g24y5b"
+
+REQUIRED_LABELS = {
+    "owner": "student-eh0vk",
+    "environment": "production",
+    "cost_center": "cc-pcwi",
+}
+
+ALLOWED_STATE_BACKENDS = {"gcs", "remote"}
+
+DELETE_REQUIRES_APPROVAL = {
+    "storage_bucket",
+    "sql_database",
+    "persistent_disk",
+}
+
+
+def terraform_response(decision, reason):
+    return jsonify({
+        "decision": decision,
+        "reason": reason,
+    })
+
+
+def valid_terraform_plan(data):
+    """
+    Validate the normalized Terraform plan schema and value types.
+    """
+
+    if not isinstance(data, dict):
+        return False
+
+    required = {
+        "environment",
+        "state",
+        "providerVersion",
+        "destroyApproved",
+        "resource",
+    }
+
+    if set(data.keys()) != required:
+        return False
+
+    # Top-level types
+    if not isinstance(data["environment"], str):
+        return False
+
+    if not isinstance(data["providerVersion"], str):
+        return False
+
+    if not isinstance(data["destroyApproved"], bool):
+        return False
+
+    # State
+    state = data["state"]
+
+    if not isinstance(state, dict):
+        return False
+
+    if set(state.keys()) != {"backend", "locked"}:
+        return False
+
+    if not isinstance(state["backend"], str):
+        return False
+
+    if not isinstance(state["locked"], bool):
+        return False
+
+    # Resource
+    resource = data["resource"]
+
+    if not isinstance(resource, dict):
+        return False
+
+    required_resource = {
+        "address",
+        "type",
+        "action",
+        "labels",
+        "secret",
+        "forceDestroy",
+    }
+
+    if set(resource.keys()) != required_resource:
+        return False
+
+    if not isinstance(resource["address"], str):
+        return False
+
+    if not isinstance(resource["type"], str):
+        return False
+
+    if resource["action"] not in {
+        "create",
+        "update",
+        "delete",
+    }:
+        return False
+
+    if not isinstance(resource["labels"], dict):
+        return False
+
+    if not isinstance(resource["forceDestroy"], bool):
+        return False
+
+    # secret may be null or a string
+    if resource["secret"] is not None:
+        if not isinstance(resource["secret"], str):
+            return False
+
+    return True
+
+
+def valid_provider_version(version):
+    """
+    Accept:
+      6.2.1
+      ~> 6.0
+
+    Reject:
+      6.2
+      6.x
+      *
+      latest
+      >= 6.0
+      etc.
+    """
+
+    if version == "6.2.1":
+        return True
+
+    if version == "~> 6.0":
+        return True
+
+    return False
+
+
+def valid_secret(secret):
+    """
+    Secret must be either:
+      null
+    or:
+      secret://...
+    """
+
+    if secret is None:
+        return True
+
+    if not isinstance(secret, str):
+        return False
+
+    return bool(
+        re.fullmatch(
+            r"secret://.+",
+            secret
+        )
+    )
+
+
+@app.route("/terraform/plan", methods=["POST"])
+def terraform_plan():
+
+    try:
+        data = request.get_json()
+    except Exception:
+        return terraform_response(
+            "reject",
+            "INVALID_PLAN"
+        )
+
+    # --------------------------------------------------------
+    # 1. REQUEST / SCHEMA
+    # --------------------------------------------------------
+
+    if not valid_terraform_plan(data):
+        return terraform_response(
+            "reject",
+            "INVALID_PLAN"
+        )
+
+    state = data["state"]
+    resource = data["resource"]
+
+    # --------------------------------------------------------
+    # 2. ENVIRONMENT
+    # --------------------------------------------------------
+
+    if data["environment"] != TERRAFORM_ENVIRONMENT:
+        return terraform_response(
+            "reject",
+            "ENVIRONMENT_MISMATCH"
+        )
+
+    # --------------------------------------------------------
+    # 3. STATE SAFETY
+    # --------------------------------------------------------
+
+    if (
+        state["backend"] not in ALLOWED_STATE_BACKENDS
+        or state["locked"] is not True
+    ):
+        return terraform_response(
+            "reject",
+            "STATE_UNSAFE"
+        )
+
+    # --------------------------------------------------------
+    # 4. PROVIDER PINNING
+    # --------------------------------------------------------
+
+    if not valid_provider_version(
+        data["providerVersion"]
+    ):
+        return terraform_response(
+            "reject",
+            "UNPINNED_PROVIDER"
+        )
+
+    # --------------------------------------------------------
+    # 5. REQUIRED LABELS
+    # --------------------------------------------------------
+
+    labels = resource["labels"]
+
+    for key, expected_value in REQUIRED_LABELS.items():
+
+        if labels.get(key) != expected_value:
+            return terraform_response(
+                "reject",
+                "MISSING_LABELS"
+            )
+
+    # --------------------------------------------------------
+    # 6. SECRET SAFETY
+    # --------------------------------------------------------
+
+    if not valid_secret(resource["secret"]):
+        return terraform_response(
+            "reject",
+            "PLAINTEXT_SECRET"
+        )
+
+    # --------------------------------------------------------
+    # 7. DESTRUCTIVE ACTION APPROVAL
+    # --------------------------------------------------------
+
+    if (
+        resource["action"] == "delete"
+        and resource["type"] in DELETE_REQUIRES_APPROVAL
+        and data["destroyApproved"] is not True
+    ):
+        return terraform_response(
+            "reject",
+            "DELETE_NOT_APPROVED"
+        )
+
+    # --------------------------------------------------------
+    # 8. PRODUCTION STORAGE BUCKET SAFETY
+    # --------------------------------------------------------
+
+    if (
+        data["environment"] == TERRAFORM_ENVIRONMENT
+        and resource["type"] == "storage_bucket"
+        and resource["forceDestroy"] is True
+    ):
+        return terraform_response(
+            "reject",
+            "FORCE_DESTROY"
+        )
+
+    # --------------------------------------------------------
+    # EVERYTHING PASSED
+    # --------------------------------------------------------
+
+    return terraform_response(
+        "approve",
+        "APPROVE"
+    )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
