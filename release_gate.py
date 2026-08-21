@@ -7,6 +7,8 @@ Deterministic policy endpoint for CI release metadata validation.
 from flask import Flask, request, jsonify
 import re
 import os
+from urllib.parse import unquote, urlparse
+import html
 
 app = Flask(__name__)
 
@@ -635,6 +637,434 @@ def terraform_plan():
     return terraform_response(
         "approve",
         "APPROVE"
+    )
+
+
+# ============================================================
+# QUESTION 4 - LLM OUTPUT HANDLING GATE
+# ============================================================
+
+ALLOWED_EXTERNAL_HOSTS = {
+    "cdn-j3m8z42.example",
+    "app-edid9pw.example",
+}
+
+VALID_CHANNELS = {
+    "html",
+    "markdown",
+    "url",
+    "sql",
+    "shell",
+}
+
+
+def sanitize_response(safe, reason):
+    return jsonify({
+        "safe": safe,
+        "reason": reason
+    })
+
+
+def valid_sanitize_schema(data):
+    if not isinstance(data, dict):
+        return False
+
+    if "channel" not in data or "output" not in data:
+        return False
+
+    if data["channel"] not in VALID_CHANNELS:
+        return False
+
+    if not isinstance(data["output"], str):
+        return False
+
+    if len(data["output"]) > 20000:
+        return False
+
+    return True
+
+
+def decode_once(value):
+    """
+    Decode exactly once, in this order:
+      1. percent escapes
+      2. HTML entities
+      3. \\uXXXX escapes
+    """
+
+    decoded = unquote(value)
+
+    decoded = html.unescape(decoded)
+
+    def unicode_replace(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except ValueError:
+            return match.group(0)
+
+    decoded = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        unicode_replace,
+        decoded
+    )
+
+    return decoded
+
+
+def contains_dangerous_scheme(text):
+    """
+    Detect javascript:, data:, vbscript:
+    with optional whitespace before the colon.
+    """
+
+    if re.search(
+        r"(?i)\b(?:javascript|data|vbscript)\s*:",
+        text
+    ):
+        return True
+
+    return False
+
+
+def extract_urls(channel, text):
+    urls = []
+
+    if channel == "html":
+        # Quoted src/href attributes
+        pattern = (
+            r"""(?i)\b(?:src|href)\s*=\s*"""
+            r"""(["'])(.*?)\1"""
+        )
+
+        for match in re.finditer(pattern, text):
+            urls.append(match.group(2))
+
+    elif channel == "markdown":
+        # URL inside ](...)
+        pattern = r"""\]\(([^)]*)\)"""
+
+        for match in re.finditer(pattern, text):
+            target = match.group(1).strip()
+
+            # Markdown may contain optional title after URL.
+            # First whitespace-delimited token is the URL.
+            if target:
+                urls.append(target.split()[0])
+
+    elif channel == "url":
+        value = text.strip()
+
+        if value:
+            urls.append(value)
+
+    return urls
+
+
+def has_external_exfil(urls):
+    """
+    Absolute URLs must use exactly one of the allowed hosts.
+
+    Relative URLs are allowed.
+    Protocol-relative URLs count as absolute.
+    """
+
+    for value in urls:
+
+        value = value.strip()
+
+        # Protocol-relative URL
+        if value.startswith("//"):
+            parsed = urlparse("https:" + value)
+
+        else:
+            parsed = urlparse(value)
+
+        # No scheme/netloc means this is relative.
+        if not parsed.scheme and not parsed.netloc:
+            continue
+
+        # Anything with a scheme other than HTTP/HTTPS is dangerous.
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return False
+
+        hostname = parsed.hostname
+
+        if hostname is None:
+            continue
+
+        if hostname.lower() not in ALLOWED_EXTERNAL_HOSTS:
+            return True
+
+    return False
+
+
+def has_dangerous_url(channel, text):
+    """
+    Returns True if text contains a dangerous scheme or
+    an extracted URL has a non-http/https scheme.
+    """
+
+    if contains_dangerous_scheme(text):
+        return True
+
+    urls = extract_urls(channel, text)
+
+    for value in urls:
+
+        value = value.strip()
+
+        if value.startswith("//"):
+            # Protocol-relative references are resolved as HTTPS.
+            continue
+
+        parsed = urlparse(value)
+
+        # If an extracted URL has a scheme, it must be http/https.
+        if parsed.scheme:
+            if parsed.scheme.lower() not in {"http", "https"}:
+                return True
+
+    return False
+
+
+def has_script_tag(text):
+    """
+    Opening script, iframe, object or embed tag.
+    """
+
+    return bool(
+        re.search(
+            r"(?is)<\s*(?:script|iframe|object|embed)\b",
+            text
+        )
+    )
+
+
+def has_event_handler(text):
+    """
+    Detect on...= attributes.
+    """
+
+    return bool(
+        re.search(
+            r"""(?is)\bon[a-zA-Z0-9_-]+\s*=""",
+            text
+        )
+    )
+
+
+def has_sql_metachar(text):
+    if re.search(r"['\"]", text):
+        return True
+
+    if ";" in text:
+        return True
+
+    if "--" in text:
+        return True
+
+    if "/*" in text:
+        return True
+
+    if re.search(r"(?i)\bunion\b", text):
+        return True
+
+    if re.search(r"(?i)\bor\s+1\s*=\s*1\b", text):
+        return True
+
+    return False
+
+
+def has_shell_metachar(text):
+    if re.search(r"[;&|`<>]", text):
+        return True
+
+    if "$(" in text:
+        return True
+
+    if "${" in text:
+        return True
+
+    return False
+
+
+def would_trip_rule(channel, text):
+    """
+    Apply channel-specific rules in the exact order
+    specified by the question.
+
+    Used for the decoded-payload check.
+    """
+
+    if channel == "html":
+
+        if has_script_tag(text):
+            return True
+
+        if has_event_handler(text):
+            return True
+
+        if has_dangerous_url(channel, text):
+            return True
+
+        if has_external_exfil(
+            extract_urls(channel, text)
+        ):
+            return True
+
+    elif channel == "markdown":
+
+        if has_dangerous_url(channel, text):
+            return True
+
+        if has_external_exfil(
+            extract_urls(channel, text)
+        ):
+            return True
+
+    elif channel == "url":
+
+        if has_dangerous_url(channel, text):
+            return True
+
+        if has_external_exfil(
+            extract_urls(channel, text)
+        ):
+            return True
+
+    elif channel == "sql":
+
+        if has_sql_metachar(text):
+            return True
+
+    elif channel == "shell":
+
+        if has_shell_metachar(text):
+            return True
+
+    return False
+
+
+@app.route("/sanitize-output", methods=["POST"])
+def sanitize_output():
+
+    data = request.get_json(silent=True)
+
+    # --------------------------------------------------------
+    # 1. INVALID SCHEMA
+    # --------------------------------------------------------
+
+    if not valid_sanitize_schema(data):
+        return sanitize_response(
+            False,
+            "INVALID_SCHEMA"
+        )
+
+    channel = data["channel"]
+    output = data["output"]
+
+    # --------------------------------------------------------
+    # 2. ENCODED PAYLOAD
+    # --------------------------------------------------------
+
+    decoded = decode_once(output)
+
+    if (
+        decoded != output
+        and would_trip_rule(channel, decoded)
+    ):
+        return sanitize_response(
+            False,
+            "ENCODED_PAYLOAD"
+        )
+
+    # --------------------------------------------------------
+    # 3. CHANNEL RULES
+    # --------------------------------------------------------
+
+    if channel == "html":
+
+        if has_script_tag(output):
+            return sanitize_response(
+                False,
+                "SCRIPT_TAG"
+            )
+
+        if has_event_handler(output):
+            return sanitize_response(
+                False,
+                "EVENT_HANDLER"
+            )
+
+        if has_dangerous_url(channel, output):
+            return sanitize_response(
+                False,
+                "DANGEROUS_SCHEME"
+            )
+
+        if has_external_exfil(
+            extract_urls(channel, output)
+        ):
+            return sanitize_response(
+                False,
+                "EXTERNAL_EXFIL"
+            )
+
+    elif channel == "markdown":
+
+        if has_dangerous_url(channel, output):
+            return sanitize_response(
+                False,
+                "DANGEROUS_SCHEME"
+            )
+
+        if has_external_exfil(
+            extract_urls(channel, output)
+        ):
+            return sanitize_response(
+                False,
+                "EXTERNAL_EXFIL"
+            )
+
+    elif channel == "url":
+
+        if has_dangerous_url(channel, output):
+            return sanitize_response(
+                False,
+                "DANGEROUS_SCHEME"
+            )
+
+        if has_external_exfil(
+            extract_urls(channel, output)
+        ):
+            return sanitize_response(
+                False,
+                "EXTERNAL_EXFIL"
+            )
+
+    elif channel == "sql":
+
+        if has_sql_metachar(output):
+            return sanitize_response(
+                False,
+                "SQL_METACHAR"
+            )
+
+    elif channel == "shell":
+
+        if has_shell_metachar(output):
+            return sanitize_response(
+                False,
+                "SHELL_METACHAR"
+            )
+
+    # --------------------------------------------------------
+    # EVERYTHING PASSED
+    # --------------------------------------------------------
+
+    return sanitize_response(
+        True,
+        "SAFE"
     )
 
 if __name__ == "__main__":
