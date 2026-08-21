@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify
 import re
 import os
 from urllib.parse import unquote, urlparse
-import html
+# import html
 
 app = Flask(__name__)
 
@@ -692,10 +692,48 @@ def decode_once(value):
       3. \\uXXXX escapes
     """
 
+    # 1. Percent-decode once
     decoded = unquote(value)
 
-    decoded = html.unescape(decoded)
+    # 2. Decode ONLY the HTML entities specified by the question
+    named_entities = {
+        "&lt;": "<",
+        "&gt;": ">",
+        "&quot;": '"',
+        "&apos;": "'",
+        "&amp;": "&",
+    }
 
+    for entity, replacement in named_entities.items():
+        decoded = decoded.replace(entity, replacement)
+
+    # Numeric decimal entities: &#NN;
+    def decimal_entity(match):
+        try:
+            return chr(int(match.group(1), 10))
+        except ValueError:
+            return match.group(0)
+
+    decoded = re.sub(
+        r"&#([0-9]+);",
+        decimal_entity,
+        decoded
+    )
+
+    # Numeric hexadecimal entities: &#xNN;
+    def hex_entity(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except ValueError:
+            return match.group(0)
+
+    decoded = re.sub(
+        r"&#x([0-9a-fA-F]+);",
+        hex_entity,
+        decoded
+    )
+
+    # 3. Decode \uXXXX once
     def unicode_replace(match):
         try:
             return chr(int(match.group(1), 16))
