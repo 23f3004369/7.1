@@ -2,7 +2,8 @@ name: TDS GA7 Release Gate
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
 
 jobs:
   test-release-gate:
@@ -32,37 +33,7 @@ jobs:
         run: |
           response=$(curl -s -X POST http://localhost:8080/release-gate \
             -H "Content-Type: application/json" \
-            -d '{
-              "target": "production",
-              "event": "push",
-              "ref": "refs/heads/main",
-              "workflow": {
-                "trigger": "push",
-                "permissions": {
-                  "contents": "read",
-                  "packages": "write",
-                  "id-token": "none"
-                },
-                "testsPassed": true,
-                "matrixComplete": true,
-                "failFast": true,
-                "environmentApproval": true
-              },
-              "actions": [
-                {
-                  "owner": "actions",
-                  "name": "checkout",
-                  "ref": "v4"
-                }
-              ],
-              "image": {
-                "multistage": true,
-                "runsAsRoot": false,
-                "secretMode": "none",
-                "criticalVulnerabilities": 0,
-                "digestPinned": true
-              }
-            }')
+            -d '{"target":"production","event":"push","ref":"refs/heads/main","workflow":{"trigger":"push","permissions":{"contents":"read","packages":"write","id-token":"none"},"testsPassed":true,"matrixComplete":true,"failFast":true,"environmentApproval":true},"actions":[{"owner":"actions","name":"checkout","ref":"v4"}],"image":{"multistage":true,"runsAsRoot":false,"secretMode":"none","criticalVulnerabilities":0,"digestPinned":true}}')
 
           echo "$response"
 
