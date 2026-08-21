@@ -1,0 +1,32 @@
+name: TDS GA7 Release Gate
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: TDS identity: 23f3004369@ds.study.iitm.ac.in
+        run: echo "Identity confirmed"
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      
+      - name: Install dependencies
+        run: pip install flask
+      
+      - name: Start Release Gate
+        run: python release_gate.py &
+      
+      - name: Test Valid Payload
+        run: |
+          curl -s -X POST http://localhost:8080/release-gate \
+            -H "Content-Type: application/json" \
+            -d '{"target":"production","event":"push","ref":"refs/heads/main","workflow":{"trigger":"push","permissions":{"contents":"read","packages":"write","id-token":"none"},"testsPassed":true,"matrixComplete":true,"failFast":false,"actions":[{"owner":"actions","name":"checkout","ref":"v4"}]},"image":{"multiStage":true,"runsAsRoot":false,"secretMode":"none","criticalVulnerabilities":0,"digestPinned":true}}' \
+            | jq .
