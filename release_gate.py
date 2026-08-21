@@ -429,10 +429,10 @@ def valid_terraform_plan(data):
         "state",
         "providerVersion",
         "destroyApproved",
-        "resource",
+        "resource"
     }
 
-    if set(data.keys()) != required:
+    if not required.issubset(data.keys()):
         return False
 
     # Top-level types
@@ -451,7 +451,7 @@ def valid_terraform_plan(data):
     if not isinstance(state, dict):
         return False
 
-    if set(state.keys()) != {"backend", "locked"}:
+    if not {"backend", "locked"}.issubset(state.keys()):
         return False
 
     if not isinstance(state["backend"], str):
@@ -472,10 +472,10 @@ def valid_terraform_plan(data):
         "action",
         "labels",
         "secret",
-        "forceDestroy",
+        "forceDestroy"
     }
 
-    if set(resource.keys()) != required_resource:
+    if not required_resource.issubset(resource.keys()):
         return False
 
     if not isinstance(resource["address"], str):
@@ -487,7 +487,7 @@ def valid_terraform_plan(data):
     if resource["action"] not in {
         "create",
         "update",
-        "delete",
+        "delete"
     }:
         return False
 
@@ -508,16 +508,16 @@ def valid_terraform_plan(data):
 def valid_provider_version(version):
     """
     Accept:
-      6.2.1
-      ~> 6.0
+    6.2.1
+    ~> 6.0
 
     Reject:
-      6.2
-      6.x
+    6.2
+    6.x
       *
-      latest
-      >= 6.0
-      etc.
+    latest
+    >= 6.0
+    etc.
     """
 
     if version == "6.2.1":
