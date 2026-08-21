@@ -404,10 +404,10 @@ ALLOWED_STATE_BACKENDS = {
     "gcs",
     "s3",
     "azurerm",
-    "remote"
+    "remote",
 }
 
-DELETE_REQUIRES_APPROVAL = {
+PROTECTED_DELETE_TYPES = {
     "storage_bucket",
     "sql_database",
     "persistent_disk",
@@ -417,19 +417,20 @@ DELETE_REQUIRES_APPROVAL = {
 def terraform_response(decision, reason):
     return jsonify({
         "decision": decision,
-        "reason": reason,
+        "reason": reason
     })
 
 
 def valid_terraform_plan(data):
     """
-    Validate the normalized Terraform plan schema and value types.
+    Validate the request and the required nested value types.
     """
 
     if not isinstance(data, dict):
         return False
 
-    required = {
+    # Required top-level fields
+    required_top = {
         "environment",
         "state",
         "providerVersion",
@@ -437,7 +438,7 @@ def valid_terraform_plan(data):
         "resource"
     }
 
-    if not required.issubset(data.keys()):
+    if not required_top.issubset(data):
         return False
 
     # Top-level types
@@ -450,13 +451,16 @@ def valid_terraform_plan(data):
     if not isinstance(data["destroyApproved"], bool):
         return False
 
-    # State
+    # --------------------------------------------------------
+    # STATE
+    # --------------------------------------------------------
+
     state = data["state"]
 
     if not isinstance(state, dict):
         return False
 
-    if not {"backend", "locked"}.issubset(state.keys()):
+    if "backend" not in state or "locked" not in state:
         return False
 
     if not isinstance(state["backend"], str):
@@ -465,7 +469,10 @@ def valid_terraform_plan(data):
     if not isinstance(state["locked"], bool):
         return False
 
-    # Resource
+    # --------------------------------------------------------
+    # RESOURCE
+    # --------------------------------------------------------
+
     resource = data["resource"]
 
     if not isinstance(resource, dict):
@@ -480,7 +487,7 @@ def valid_terraform_plan(data):
         "forceDestroy"
     }
 
-    if not required_resource.issubset(resource.keys()):
+    if not required_resource.issubset(resource):
         return False
 
     if not isinstance(resource["address"], str):
@@ -492,19 +499,27 @@ def valid_terraform_plan(data):
     if not isinstance(resource["action"], str):
         return False
 
-    if not isinstance(resource["labels"], dict):
+    if resource["action"] not in {
+        "create",
+        "update",
+        "delete"
+    }:
         return False
 
-    if not all(
-        isinstance(key, str) and isinstance(value, str)
-        for key, value in resource["labels"].items()
-    ):
+    if not isinstance(resource["labels"], dict):
         return False
 
     if not isinstance(resource["forceDestroy"], bool):
         return False
 
-    # secret may be null or a string
+    # Every label key/value must be a string
+    for key, value in resource["labels"].items():
+        if not isinstance(key, str):
+            return False
+        if not isinstance(value, str):
+            return False
+
+    # secret is allowed to be null or string
     if resource["secret"] is not None:
         if not isinstance(resource["secret"], str):
             return False
@@ -513,26 +528,12 @@ def valid_terraform_plan(data):
 
 
 def valid_provider_version(version):
-    """
-    Accept:
-      6.2.1
-      = 6.2.1
-      ~> 6.0
-
-    Reject:
-      >= 6.0
-      *
-      latest
-      6.x
-      6.2
-      etc.
-    """
-
     return version in {
         "6.2.1",
         "= 6.2.1",
         "~> 6.0"
     }
+
 
 def valid_secret(secret):
     if secret is None:
@@ -547,16 +548,10 @@ def valid_secret(secret):
 @app.route("/terraform/plan", methods=["POST"])
 def terraform_plan():
 
-    try:
-        data = request.get_json()
-    except Exception:
-        return terraform_response(
-            "reject",
-            "INVALID_PLAN"
-        )
+    data = request.get_json(silent=True)
 
     # --------------------------------------------------------
-    # 1. REQUEST / SCHEMA
+    # 1. SCHEMA
     # --------------------------------------------------------
 
     if not valid_terraform_plan(data):
@@ -567,6 +562,7 @@ def terraform_plan():
 
     state = data["state"]
     resource = data["resource"]
+    labels = resource["labels"]
 
     # --------------------------------------------------------
     # 2. ENVIRONMENT
@@ -579,7 +575,7 @@ def terraform_plan():
         )
 
     # --------------------------------------------------------
-    # 3. STATE SAFETY
+    # 3. STATE
     # --------------------------------------------------------
 
     if (
@@ -592,7 +588,7 @@ def terraform_plan():
         )
 
     # --------------------------------------------------------
-    # 4. PROVIDER PINNING
+    # 4. PROVIDER
     # --------------------------------------------------------
 
     if not valid_provider_version(
@@ -604,21 +600,18 @@ def terraform_plan():
         )
 
     # --------------------------------------------------------
-    # 5. REQUIRED LABELS
+    # 5. LABELS
     # --------------------------------------------------------
 
-    labels = resource["labels"]
-
-    for key, expected_value in REQUIRED_LABELS.items():
-
-        if labels.get(key) != expected_value:
+    for key, expected in REQUIRED_LABELS.items():
+        if labels.get(key) != expected:
             return terraform_response(
                 "reject",
                 "MISSING_LABELS"
             )
 
     # --------------------------------------------------------
-    # 6. SECRET SAFETY
+    # 6. SECRET
     # --------------------------------------------------------
 
     if not valid_secret(resource["secret"]):
@@ -628,16 +621,12 @@ def terraform_plan():
         )
 
     # --------------------------------------------------------
-    # 7. DESTRUCTIVE ACTION APPROVAL
+    # 7. STATEFUL DELETE
     # --------------------------------------------------------
 
     if (
         resource["action"] == "delete"
-        and resource["type"] in {
-            "storage_bucket",
-            "sql_database",
-            "persistent_disk",
-        }
+        and resource["type"] in PROTECTED_DELETE_TYPES
         and data["destroyApproved"] is not True
     ):
         return terraform_response(
@@ -646,13 +635,13 @@ def terraform_plan():
         )
 
     # --------------------------------------------------------
-    # 8. PRODUCTION STORAGE BUCKET SAFETY
+    # 8. PRODUCTION FORCE DESTROY
     # --------------------------------------------------------
 
     if (
         resource["type"] == "storage_bucket"
-        and resource["forceDestroy"] is True
         and labels.get("environment") == "production"
+        and resource["forceDestroy"] is True
     ):
         return terraform_response(
             "reject",
@@ -660,7 +649,7 @@ def terraform_plan():
         )
 
     # --------------------------------------------------------
-    # EVERYTHING PASSED
+    # ALL RULES PASSED
     # --------------------------------------------------------
 
     return terraform_response(
