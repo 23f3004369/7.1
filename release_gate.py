@@ -8,7 +8,10 @@ from flask import Flask, request, jsonify
 import re
 import os
 from urllib.parse import unquote, urlparse
-# import html
+from datetime import datetime, timezone
+import math
+import numbers
+
 
 app = Flask(__name__)
 
@@ -1095,6 +1098,264 @@ def sanitize_output():
     return sanitize_response(
         True,
         "SAFE"
+    )
+
+# ============================================================
+# QUESTION 5 - OSINT CORROBORATION ENGINE
+# ============================================================
+
+VALID_SOURCE_TYPES = {
+    "dns",
+    "ct_log",
+    "registry",
+    "archive",
+    "scan",
+}
+
+
+def osint_response(verdict, confidence, sources):
+    return jsonify({
+        "verdict": verdict,
+        "confidence": confidence,
+        "corroboratingSources": sources
+    })
+
+
+def parse_timestamp(value):
+    """Parse an ISO-8601 timestamp."""
+    if not isinstance(value, str):
+        return None
+
+    try:
+        # Handle timestamps ending in Z
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+
+        dt = datetime.fromisoformat(value)
+
+        # Treat naive timestamps as UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(timezone.utc)
+
+    except (ValueError, TypeError):
+        return None
+
+
+def valid_source(source):
+    """
+    A source is valid only when:
+      id, origin, value, observedAt are strings
+      type is one of the allowed source types
+    """
+
+    if not isinstance(source, dict):
+        return False
+
+    if not isinstance(source.get("id"), str):
+        return False
+
+    if not isinstance(source.get("origin"), str):
+        return False
+
+    if not isinstance(source.get("value"), str):
+        return False
+
+    if not isinstance(source.get("observedAt"), str):
+        return False
+
+    if source.get("type") not in VALID_SOURCE_TYPES:
+        return False
+
+    return True
+
+
+def is_fresh(source, as_of, staleness_days):
+    observed_at = parse_timestamp(source["observedAt"])
+
+    if observed_at is None:
+        return False
+
+    age_seconds = (as_of - observed_at).total_seconds()
+    max_age_seconds = staleness_days * 86400
+
+    return age_seconds <= max_age_seconds
+
+
+@app.route("/corroborate", methods=["POST"])
+def corroborate():
+
+    data = request.get_json(silent=True)
+
+    # ========================================================
+    # 1. INVALID REQUEST
+    # ========================================================
+
+    if not isinstance(data, dict):
+        return osint_response(
+            "invalid",
+            "low",
+            []
+        )
+
+    claim = data.get("claim")
+
+    if not isinstance(claim, dict):
+        return osint_response(
+            "invalid",
+            "low",
+            []
+        )
+
+    if not isinstance(claim.get("value"), str):
+        return osint_response(
+            "invalid",
+            "low",
+            []
+        )
+
+    as_of = parse_timestamp(data.get("asOf"))
+
+    if as_of is None:
+        return osint_response(
+            "invalid",
+            "low",
+            []
+        )
+
+    staleness_days = data.get("stalenessDays")
+
+    # bool is technically an int in Python, but must not count
+    # as a number here.
+    if (
+        isinstance(staleness_days, bool)
+        or not isinstance(staleness_days, numbers.Number)
+        or not math.isfinite(float(staleness_days))
+    ):
+        return osint_response(
+            "invalid",
+            "low",
+            []
+        )
+
+    sources = data.get("sources")
+
+    if not isinstance(sources, list):
+        return osint_response(
+            "invalid",
+            "low",
+            []
+        )
+
+    claim_value = claim["value"]
+
+    # ========================================================
+    # 2. AUTHORITATIVE FRESH CONTRADICTION
+    # ========================================================
+
+    contradicting = []
+
+    for source in sources:
+
+        # Invalid sources are ignored entirely
+        if not valid_source(source):
+            continue
+
+        if not is_fresh(
+            source,
+            as_of,
+            staleness_days
+        ):
+            continue
+
+        if (
+            source.get("authoritative") is True
+            and source["value"] != claim_value
+        ):
+            contradicting.append(source["id"])
+
+    if contradicting:
+
+        return osint_response(
+            "contradicted",
+            "low",
+            sorted(contradicting)
+        )
+
+    # ========================================================
+    # 3. SUPPORT
+    # ========================================================
+
+    # Keep only fresh sources that agree with the claim
+    matching_sources = []
+
+    for source in sources:
+
+        if not valid_source(source):
+            continue
+
+        if not is_fresh(
+            source,
+            as_of,
+            staleness_days
+        ):
+            continue
+
+        if source["value"] == claim_value:
+            matching_sources.append(source)
+
+    # --------------------------------------------------------
+    # Reduce to one representative per origin.
+    # Representative = lexicographically smallest ID.
+    # --------------------------------------------------------
+
+    representatives = {}
+
+    for source in matching_sources:
+
+        origin = source["origin"]
+
+        if (
+            origin not in representatives
+            or source["id"] < representatives[origin]["id"]
+        ):
+            representatives[origin] = source
+
+    reps = list(representatives.values())
+
+    # Need at least two independent origins
+    if len(reps) >= 2:
+
+        ids = sorted(
+            source["id"]
+            for source in reps
+        )
+
+        distinct_types = {
+            source["type"]
+            for source in reps
+        }
+
+        if len(distinct_types) >= 2:
+            confidence = "high"
+        else:
+            confidence = "medium"
+
+        return osint_response(
+            "supported",
+            confidence,
+            ids
+        )
+
+    # ========================================================
+    # 4. UNVERIFIED
+    # ========================================================
+
+    return osint_response(
+        "unverified",
+        "low",
+        []
     )
 
 if __name__ == "__main__":
