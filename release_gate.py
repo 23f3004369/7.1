@@ -529,25 +529,13 @@ def valid_provider_version(version):
     }
 
 def valid_secret(secret):
-    """
-    Secret must be either:
-      null
-    or:
-      secret://...
-    """
-
     if secret is None:
         return True
 
     if not isinstance(secret, str):
         return False
 
-    return bool(
-        re.fullmatch(
-            r"secret://.+",
-            secret
-        )
-    )
+    return secret.startswith("secret://") and len(secret) > len("secret://")
 
 
 @app.route("/terraform/plan", methods=["POST"])
