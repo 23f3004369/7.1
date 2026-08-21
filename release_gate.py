@@ -755,13 +755,12 @@ def contains_dangerous_scheme(text):
     with optional whitespace before the colon.
     """
 
-    if re.search(
-        r"(?i)\b(?:javascript|data|vbscript)\s*:",
-        text
-    ):
-        return True
-
-    return False
+    return bool(
+        re.search(
+            r"(?i)(?:javascript|data|vbscript)\s*:",
+            text
+        )
+    )
 
 
 def extract_urls(channel, text):
@@ -807,23 +806,16 @@ def has_external_exfil(urls):
     """
 
     for value in urls:
-
         value = value.strip()
 
-        # Protocol-relative URL
         if value.startswith("//"):
             parsed = urlparse("https:" + value)
-
         else:
             parsed = urlparse(value)
 
-        # No scheme/netloc means this is relative.
+        # Relative reference
         if not parsed.scheme and not parsed.netloc:
             continue
-
-        # Anything with a scheme other than HTTP/HTTPS is dangerous.
-        if parsed.scheme.lower() not in {"http", "https"}:
-            return False
 
         hostname = parsed.hostname
 
