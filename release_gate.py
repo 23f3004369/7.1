@@ -400,7 +400,12 @@ REQUIRED_LABELS = {
     "cost_center": "cc-pcwi",
 }
 
-ALLOWED_STATE_BACKENDS = {"gcs", "remote"}
+ALLOWED_STATE_BACKENDS = {
+    "gcs",
+    "s3",
+    "azurerm",
+    "remote"
+}
 
 DELETE_REQUIRES_APPROVAL = {
     "storage_bucket",
@@ -484,11 +489,7 @@ def valid_terraform_plan(data):
     if not isinstance(resource["type"], str):
         return False
 
-    if resource["action"] not in {
-        "create",
-        "update",
-        "delete"
-    }:
+    if not isinstance(resource["action"], str):
         return False
 
     if not isinstance(resource["labels"], dict):
@@ -508,26 +509,24 @@ def valid_terraform_plan(data):
 def valid_provider_version(version):
     """
     Accept:
-    6.2.1
-    ~> 6.0
+      6.2.1
+      = 6.2.1
+      ~> 6.0
 
     Reject:
-    6.2
-    6.x
+      >= 6.0
       *
-    latest
-    >= 6.0
-    etc.
+      latest
+      6.x
+      6.2
+      etc.
     """
 
-    if version == "6.2.1":
-        return True
-
-    if version == "~> 6.0":
-        return True
-
-    return False
-
+    return version in {
+        "6.2.1",
+        "= 6.2.1",
+        "~> 6.0"
+    }
 
 def valid_secret(secret):
     """
